@@ -1,0 +1,24 @@
+# SwiftFormat config for Tally — conservative, matches the existing hand-written style.
+--swiftversion 6.0
+
+# Indentation / wrapping
+--indent 4
+--maxwidth 110
+--wrapparameters beforefirst
+--wraparguments beforefirst
+--wrapcollections beforefirst
+
+# Keep the codebase's existing idioms
+--self remove
+--importgrouping testable-bottom
+--commas inline
+--trimwhitespace always
+--semicolons never
+
+# Don't fight intentional formatting
+--ranges no-space          # 0..<count style without spaces
+--disable wrapMultilineStatementBraces
+--disable redundantReturn   # keep explicit returns where used for clarity
+
+# Exclude build artifacts and the test fixtures' literal strings
+--exclude .build,Tally.app

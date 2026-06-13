@@ -1,0 +1,46 @@
+# SwiftLint config for Tally — pragmatic for a personal menu bar app.
+
+included:
+  - Sources
+  - Tests
+
+excluded:
+  - .build
+  - Tally.app
+
+# Rules we deliberately don't want to fight.
+disabled_rules:
+  - line_length            # handled by SwiftFormat's --maxwidth
+  - todo                   # no TODOs today; don't fail the build if one's added
+  - trailing_comma
+  - identifier_name        # short names like rx/tx/db/vm are intentional and clear here
+
+# Useful opt-in rules worth turning on.
+opt_in_rules:
+  - empty_count
+  - first_where
+  - contains_over_first_not_nil
+  - redundant_nil_coalescing
+  - closure_spacing
+  - operator_usage_whitespace
+  # sorted_imports intentionally NOT enabled: it conflicts with SwiftFormat's
+  # --importgrouping testable-bottom (regular imports first, @testable after).
+
+force_try:
+  severity: warning        # Database.shared uses try! intentionally; warn, don't error
+
+type_body_length:
+  warning: 400
+  error: 600
+
+function_body_length:
+  warning: 80
+  error: 150
+
+file_length:
+  warning: 500
+  error: 800
+
+# nettop/getifaddrs constants and SwiftUI view bodies legitimately nest.
+cyclomatic_complexity:
+  warning: 15
