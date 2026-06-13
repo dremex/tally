@@ -73,7 +73,7 @@ actor PingProbe {
             target: target, label: label,
             avgMs: avg, minMs: oks.min() ?? 0, maxMs: oks.max() ?? 0,
             jitterMs: jitter, lossPct: loss,
-            lastMs: samples.last.flatMap { $0 }, reachable: !oks.isEmpty
+            lastMs: samples.last.flatMap(\.self), reachable: !oks.isEmpty
         )
     }
 }

@@ -4,6 +4,7 @@ import SwiftUI
 struct SettingsView: View {
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var error: String?
+    @State private var exportStatus: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -26,6 +27,19 @@ struct SettingsView: View {
                     .font(.caption2).foregroundStyle(.tertiary).textSelection(.enabled)
             }
 
+            Divider()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Button {
+                    exportCSV()
+                } label: {
+                    Label("Export data as CSV…", systemImage: "square.and.arrow.up")
+                }
+                if let exportStatus {
+                    Text(exportStatus).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+            }
+
             Spacer()
 
             Button(role: .destructive) {
@@ -35,6 +49,22 @@ struct SettingsView: View {
             }
         }
         .padding()
+    }
+
+    private func exportCSV() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export Here"
+        panel.message = "Choose a folder for the exported CSV files"
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+        do {
+            let folder = try DataExporter.exportCSV(to: dir)
+            exportStatus = "Exported to \(folder.lastPathComponent)/"
+        } catch {
+            exportStatus = "Export failed: \(error.localizedDescription)"
+        }
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
