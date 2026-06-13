@@ -7,7 +7,7 @@
 	<key>CFBundleDisplayName</key>
 	<string>Tally</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.kerry.tally</string>
+	<string>net.xmech.tally</string>
 	<key>CFBundleExecutable</key>
 	<string>Tally</string>
 	<key>CFBundlePackageType</key>
