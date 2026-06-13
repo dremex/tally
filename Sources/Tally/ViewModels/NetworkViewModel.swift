@@ -40,9 +40,13 @@ final class NetworkViewModel: ObservableObject {
 
     func updateLive(_ sample: InterfaceSample, at time: Date) {
         let reading = sample.total
-        rxRate = reading.rxRate
-        txRate = reading.txRate
-        perInterface = sample.perInterface
+        // Only publish when a value actually changes: every assignment to an @Published fires
+        // objectWillChange and forces dependent views (incl. the always-present menu-bar label)
+        // to redraw. When the network is idle these are 0→0 writes, so guarding them eliminates
+        // a per-second redraw that otherwise runs forever whether or not the popover is open.
+        if reading.rxRate != rxRate { rxRate = reading.rxRate }
+        if reading.txRate != txRate { txRate = reading.txRate }
+        if sample.perInterface != perInterface { perInterface = sample.perInterface }
         // vpnActive/vpnInterfaces are set by the coordinator from the default-route interface,
         // not from "any utun exists" — see SamplingCoordinator.refreshGateway().
         recent.append(RatePoint(time: time, rxRate: reading.rxRate, txRate: reading.txRate))
@@ -84,7 +88,19 @@ final class NetworkViewModel: ObservableObject {
     /// The menu bar renders labels as monochrome template images, so a coloured SwiftUI `Text`
     /// gets flattened. To actually colour the down/up parts we draw an NSImage ourselves (marked
     /// non-template so the colours survive) and use it as the MenuBarExtra label.
+    private var cachedMenuBarText: String?
+    private var cachedMenuBarImage: NSImage?
+
     func renderMenuBarImage() -> NSImage {
+        // The visible label is the *formatted* string ("↓ 2.1M ↑ 120K"), which is far coarser than
+        // the raw rates — small per-second fluctuations don't change it. Redrawing the NSImage is
+        // real CoreGraphics work (lockFocus/draw/unlockFocus); cache on the rendered text so we only
+        // rebuild when the label actually changes, not on every tick.
+        let text = menuBarText
+        if text == cachedMenuBarText, let cached = cachedMenuBarImage {
+            return cached
+        }
+
         // Heavier + brighter than the in-popover palette: the menu bar sits on a coloured
         // wallpaper, where the muted Gruvbox tones wash out. Use the brighter accent variants.
         let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
@@ -108,6 +124,8 @@ final class NetworkViewModel: ObservableObject {
         s.draw(at: NSPoint(x: pad, y: (18 - size.height) / 2))
         image.unlockFocus()
         image.isTemplate = false // keep our colours; don't let the menu bar monochrome it
+        cachedMenuBarText = text
+        cachedMenuBarImage = image
         return image
     }
 }

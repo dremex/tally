@@ -106,8 +106,8 @@ struct NetworkTab: View {
             Text(Fmt.rate(rate))
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
                 .foregroundStyle(color).monospacedDigit()
-                .contentTransition(.numericText())
-                .animation(.snappy(duration: 0.3), value: rate)
+            // No numericText animation here: these rates change every second, so a 0.3s roll never
+            // settles before the next value arrives — it pins CoreAnimation at 60fps continuously.
         }
     }
 
@@ -353,8 +353,9 @@ struct NetworkTab: View {
             Text(name).lineLimit(1)
             Spacer()
             VStack(alignment: .trailing, spacing: 1) {
+                // Live app rates refresh every ~5s and re-sort; skip the per-value roll animation
+                // (it restarts on every refresh and keeps the layer tree redrawing).
                 Text(primary).monospacedDigit()
-                    .contentTransition(.numericText()).animation(.snappy(duration: 0.3), value: primary)
                 HStack(spacing: 6) {
                     Text(down).foregroundStyle(Theme.download)
                     Text(up).foregroundStyle(Theme.upload)

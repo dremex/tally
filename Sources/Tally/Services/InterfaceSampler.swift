@@ -16,7 +16,7 @@ struct ThroughputReading {
 }
 
 /// Live rate for a single interface — for the Connection tab's per-interface breakdown.
-struct InterfaceRate: Identifiable {
+struct InterfaceRate: Identifiable, Equatable {
     var name: String // e.g. "en0"
     var rxRate: Double // bytes/sec
     var txRate: Double // bytes/sec
