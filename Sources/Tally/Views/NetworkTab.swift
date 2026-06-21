@@ -25,6 +25,17 @@ struct NetworkTab: View {
             case .month: return 30 * 86400
             }
         }
+
+        /// Bucket width for downsampling the chart query, in seconds (0 = fetch raw rows). Hour/Day
+        /// are small enough to plot raw; Week/Month would otherwise pull tens to hundreds of
+        /// thousands of 10s rows, so we aggregate to ~300 points — all the 120px chart can show.
+        var bucketSeconds: Int {
+            switch self {
+            case .live, .hour, .day: return 0
+            case .week: return 7 * 86400 / 300 // ~33 min buckets
+            case .month: return 30 * 86400 / 300 // ~2.4 h buckets
+            }
+        }
     }
 
     @EnvironmentObject var vm: NetworkViewModel
@@ -42,6 +53,15 @@ struct NetworkTab: View {
     private let db = Database.shared
     private let refresh = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     @State private var tick = 0
+    /// Discards stale async-read results so quickly switching ranges never shows a stale range's data.
+    @State private var gate = LoadGate()
+    /// The range whose data is currently displayed (nil while a switch is loading). Lets timer ticks
+    /// skip the rollup query without redundant work, and is invalidated to nil the moment a range
+    /// switch starts so a switch *back* before the read returns is still recognized as a switch.
+    @State private var loadedRange: Range?
+    /// True from a range switch until that range's read returns — drives the skeleton placeholders
+    /// so we never hold the previous range's graph/totals/list on screen while the query runs.
+    @State private var loading = false
     @State private var drained = false // refresh-bar animation state (full → empty per interval)
 
     // Graph hover: the time under the cursor, and the apps active in that window (highlighted below).
@@ -68,11 +88,16 @@ struct NetworkTab: View {
             .labelsHidden()
 
             header
-            graph.frame(height: 120)
-            if range != .live { totalsStrip }
+            Group {
+                if loading { graphSkeleton } else { graph }
+            }
+            .frame(height: 120)
+            if range != .live {
+                if loading { totalsSkeleton } else { totalsStrip }
+            }
             Divider()
             appsHeader
-            appList
+            if loading { appListSkeleton } else { appList }
         }
         .padding()
         .onAppear(perform: reload)
@@ -411,25 +436,116 @@ struct NetworkTab: View {
         .frame(maxWidth: .infinity, minHeight: 80)
     }
 
+    // MARK: - Skeletons (shown while a newly-selected range loads)
+
+    private var graphSkeleton: some View {
+        RoundedRectangle(cornerRadius: 6).fill(Theme.bg2)
+            .shimmer()
+            .overlay(
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading \(range.rawValue.lowercased())…")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            )
+    }
+
+    private var totalsSkeleton: some View {
+        HStack(spacing: 0) {
+            ForEach(0..<3) { i in
+                VStack(spacing: 4) {
+                    SkeletonBar(width: 52, height: 9, cornerRadius: 3)
+                    SkeletonBar(width: 70, height: 17)
+                }
+                .frame(maxWidth: .infinity)
+                if i < 2 { Divider().frame(height: 34) }
+            }
+        }
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(Theme.card, in: RoundedRectangle(cornerRadius: 8))
+        .shimmer()
+    }
+
+    private var appListSkeleton: some View {
+        VStack(spacing: 0) {
+            ForEach(0..<5, id: \.self) { _ in
+                HStack(spacing: 10) {
+                    SkeletonBar(width: 20, height: 20, cornerRadius: 5)
+                    SkeletonBar(width: 110, height: 11)
+                    Spacer()
+                    SkeletonBar(width: 60, height: 11)
+                }
+                .padding(.vertical, 5).padding(.horizontal, 6)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .shimmer()
+    }
+
     // MARK: - Data loading
 
     private func reload() {
-        guard range != .live else { return } // live data is pushed by the view model
+        guard range != .live else {
+            // Live data is pushed by the view model. Drop any skeleton and invalidate loadedRange so
+            // that switching back to a history range refetches it (its rollup may have moved on).
+            loading = false
+            loadedRange = nil
+            return
+        }
         let now = Date()
         guard let interval = range.interval else { return }
         domainStart = now.addingTimeInterval(-interval)
         domainEnd = now
-        samples = db.throughputSamples(since: domainStart)
-        periodTotal = (samples.reduce(0) { $0 + $1.rxBytes }, samples.reduce(0) { $0 + $1.txBytes })
+
+        // Only the moving graph edge changes on a timer tick; the per-app rollup is per-day and
+        // need not be re-queried every second. Refetch it only when this load targets a range whose
+        // data isn't already displayed — i.e. `loadedRange` (the range currently on screen) differs.
+        // We compare against `loadedRange` both here and in the completion so the two stay in lockstep
+        // even when range switches collapse (A→B→A before B's read returns): `loading` is then driven
+        // purely by `targetRange != loadedRange`, never a stale captured Bool.
+        let switchingRange = loadedRange != range
+        if switchingRange {
+            // Clear the previous range's data and show skeletons while the read runs, rather than
+            // holding stale content that visibly "hangs" then snaps to the new values. Invalidate
+            // loadedRange now (nothing valid is on screen) so that a switch *back* to this range
+            // before the read returns still counts as switching and re-requests its data — otherwise
+            // the back-switch sees loadedRange already == range and never repopulates / clears loading.
+            loadedRange = nil
+            rangeUsage = []
+            samples = []
+            periodTotal = (0, 0)
+            loading = true
+        }
 
         let cal = Calendar.current
-        let sinceDay: String
+        let sinceDay: String?
         switch range {
         case .hour, .day: sinceDay = Self.dayFormatter.string(from: cal.startOfDay(for: now))
         case .week: sinceDay = Self.dayFormatter.string(from: now.addingTimeInterval(-6 * 86400))
         case .month: sinceDay = Self.dayFormatter.string(from: now.addingTimeInterval(-29 * 86400))
         case .live: return
         }
-        rangeUsage = db.appUsageDaily(sinceDay: sinceDay)
+
+        let token = gate.begin()
+        let targetRange = range
+        db.historySnapshot(
+            since: domainStart,
+            sinceDay: sinceDay,
+            includeUsage: switchingRange,
+            bucketSeconds: targetRange.bucketSeconds
+        ) { snapshot in
+            // Ignore results from a load that's been superseded by a newer range/tick.
+            guard gate.isCurrent(token), targetRange == range else { return }
+            samples = snapshot.samples
+            periodTotal = snapshot.periodTotal
+            // Finalize on the live relationship, not the captured `switchingRange`: if this result
+            // brings a not-yet-displayed range on screen, commit its usage and drop the skeleton.
+            if targetRange != loadedRange {
+                rangeUsage = snapshot.rangeUsage
+                loadedRange = targetRange
+                loading = false
+            }
+        }
     }
 }

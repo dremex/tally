@@ -148,28 +148,6 @@ final class Database: Sendable {
 
     // MARK: - Reads (History tab)
 
-    /// Throughput samples within [since, now], oldest first — for the history chart.
-    func throughputSamples(since: Date) -> [ThroughputSample] {
-        (try? pool.read { db in
-            try ThroughputSample
-                .filter(ThroughputSample.Columns.ts >= since)
-                .order(ThroughputSample.Columns.ts.asc)
-                .fetchAll(db)
-        }) ?? []
-    }
-
-    /// Summed bytes over a window — for the "today" / "this month" total figures.
-    func totalBytes(since: Date) -> (rx: Int64, tx: Int64) {
-        let row = try? pool.read { db in
-            try Row.fetchOne(db, sql: """
-            SELECT COALESCE(SUM(rxBytes),0) AS rx, COALESCE(SUM(txBytes),0) AS tx
-            FROM throughput_sample WHERE ts >= ?
-            """, arguments: [since])
-        }
-        guard let row else { return (0, 0) }
-        return (row["rx"], row["tx"])
-    }
-
     /// Raw quality samples in [since, now], oldest first — for the Connection tab's Hour/Day graph.
     func qualitySamples(since: Date) -> [QualityPoint] {
         (try? pool.read { db in
@@ -196,57 +174,6 @@ final class Database: Sendable {
                     return QualityPoint(time: date, latencyMs: row["avgLatency"], score: row["avgScore"])
                 }
         }) ?? []
-    }
-
-    /// Highest download/upload rate ever recorded (bytes/sec), from the aggregated throughput rows.
-    func peakRates() -> (rx: Double, tx: Double) {
-        let row = try? pool.read { db in
-            try Row.fetchOne(db, sql: """
-            SELECT COALESCE(MAX(rxRate),0) AS rx, COALESCE(MAX(txRate),0) AS tx
-            FROM throughput_sample
-            """)
-        }
-        guard let row else { return (0, 0) }
-        return (row["rx"], row["tx"])
-    }
-
-    /// Per-day totals (across all apps) from the never-pruned rollup, most recent `limit` days,
-    /// returned oldest-first for charting. Powers the daily chart, averages, and busiest-day stat.
-    func dailyTotals(limit: Int = 30) -> [DailyTotal] {
-        (try? pool.read { db in
-            let rows = try DailyTotal.fetchAll(db, sql: """
-            SELECT day,
-                   COALESCE(SUM(rxBytes),0) AS rxBytes,
-                   COALESCE(SUM(txBytes),0) AS txBytes
-            FROM app_daily
-            GROUP BY day
-            ORDER BY day DESC
-            LIMIT ?
-            """, arguments: [limit])
-            return rows.reversed() // oldest-first for the chart
-        }) ?? []
-    }
-
-    /// All-time total bytes across every app/day in the never-pruned rollup.
-    func allTimeBytes() -> (rx: Int64, tx: Int64) {
-        let row = try? pool.read { db in
-            try Row.fetchOne(db, sql: """
-            SELECT COALESCE(SUM(rxBytes),0) AS rx, COALESCE(SUM(txBytes),0) AS tx FROM app_daily
-            """)
-        }
-        guard let row else { return (0, 0) }
-        return (row["rx"], row["tx"])
-    }
-
-    /// Number of distinct days with recorded usage, and the earliest day string (nil if none).
-    func trackingSince() -> (days: Int, earliest: String?) {
-        let row = try? pool.read { db in
-            try Row.fetchOne(db, sql: """
-            SELECT COUNT(DISTINCT day) AS days, MIN(day) AS earliest FROM app_daily
-            """)
-        }
-        guard let row else { return (0, nil) }
-        return (row["days"], row["earliest"])
     }
 
     /// Apps that were transferring around a given instant — for the graph hover interaction.
@@ -296,22 +223,202 @@ final class Database: Sendable {
         }) ?? []
     }
 
-    /// Per-app usage from the never-pruned daily rollup, biggest first. `sinceDay` is an inclusive
-    /// local day string (yyyy-MM-dd); pass nil for all-time totals.
-    func appUsageDaily(sinceDay: String?, limit: Int = 50) -> [AppUsage] {
-        (try? pool.read { db in
-            let whereClause = sinceDay == nil ? "" : "WHERE day >= ?"
-            let args: StatementArguments = sinceDay == nil ? [limit] : [sinceDay, limit]
-            return try AppUsage.fetchAll(db, sql: """
-            SELECT processName,
-                   COALESCE(SUM(rxBytes),0) AS rxBytes,
-                   COALESCE(SUM(txBytes),0) AS txBytes
-            FROM app_daily \(whereClause)
-            GROUP BY processName
-            ORDER BY (SUM(rxBytes)+SUM(txBytes)) DESC
-            LIMIT ?
-            """, arguments: args)
-        }) ?? []
+    // MARK: - Async reads (off the main thread)
+
+    /// Snapshot of everything the Network history view needs for one range, fetched in a single
+    /// off-thread read. `completion` is called on the main queue.
+    struct HistorySnapshot {
+        var samples: [ThroughputSample]
+        var periodTotal: (rx: Int64, tx: Int64)
+        var rangeUsage: [AppUsage]
+    }
+
+    /// Read throughput samples (and, when `sinceDay != nil`, the per-app rollup) without blocking
+    /// the caller. When `includeUsage` is false the rollup query is skipped entirely — used by the
+    /// per-second timer tick, which only needs the moving graph edge refreshed.
+    ///
+    /// `bucketSeconds`: when > 0, samples are downsampled into fixed time buckets in SQL — summing
+    /// bytes and averaging rates per bucket. A month holds ~260K raw rows (one per 10s); fetching
+    /// them all to draw a 120px chart is the bulk of the switch delay, so wide ranges bucket down to
+    /// a few hundred rows. Totals are summed from the same buckets, so they stay exact regardless.
+    func historySnapshot(
+        since: Date,
+        sinceDay: String?,
+        includeUsage: Bool,
+        bucketSeconds: Int = 0,
+        completion: @escaping @MainActor (HistorySnapshot) -> Void
+    ) {
+        pool.asyncRead { dbResult in
+            let snapshot: HistorySnapshot
+            do {
+                let db = try dbResult.get()
+                let samples: [ThroughputSample] = if bucketSeconds > 0 {
+                    try Self.bucketedSamples(db, since: since, bucketSeconds: bucketSeconds)
+                } else {
+                    try ThroughputSample
+                        .filter(ThroughputSample.Columns.ts >= since)
+                        .order(ThroughputSample.Columns.ts.asc)
+                        .fetchAll(db)
+                }
+                let total = samples.reduce(into: (rx: Int64(0), tx: Int64(0))) {
+                    $0.rx += $1.rxBytes
+                    $0.tx += $1.txBytes
+                }
+                var usage: [AppUsage] = []
+                if includeUsage, let sinceDay {
+                    usage = try Self.appUsageRollup(db, sinceDay: sinceDay, limit: 50)
+                }
+                snapshot = HistorySnapshot(samples: samples, periodTotal: total, rangeUsage: usage)
+            } catch {
+                NSLog("historySnapshot read failed: \(error)")
+                snapshot = HistorySnapshot(samples: [], periodTotal: (0, 0), rangeUsage: [])
+            }
+            let result = snapshot
+            DispatchQueue.main.async { MainActor.assumeIsolated { completion(result) } }
+        }
+    }
+
+    // MARK: - Shared aggregate queries (used by the snapshot reads above)
+
+    /// Per-app summed usage from the never-pruned daily rollup, biggest first. `sinceDay` (inclusive
+    /// yyyy-MM-dd local) bounds the window; nil = all time.
+    private static func appUsageRollup(
+        _ db: GRDB.Database,
+        sinceDay: String?,
+        limit: Int
+    ) throws -> [AppUsage] {
+        let whereClause = sinceDay == nil ? "" : "WHERE day >= ?"
+        let args: StatementArguments = sinceDay == nil ? [limit] : [sinceDay, limit]
+        return try AppUsage.fetchAll(db, sql: """
+        SELECT processName,
+               COALESCE(SUM(rxBytes),0) AS rxBytes,
+               COALESCE(SUM(txBytes),0) AS txBytes
+        FROM app_daily \(whereClause)
+        GROUP BY processName
+        ORDER BY (SUM(rxBytes)+SUM(txBytes)) DESC
+        LIMIT ?
+        """, arguments: args)
+    }
+
+    /// Summed rx/tx bytes from `table` where `ts >= since` (a `.datetime` column) — for window totals.
+    private static func sumBytes(
+        _ db: GRDB.Database,
+        table: String,
+        since: Date
+    ) throws -> (rx: Int64, tx: Int64) {
+        let row = try Row.fetchOne(db, sql: """
+        SELECT COALESCE(SUM(rxBytes),0) AS rx, COALESCE(SUM(txBytes),0) AS tx
+        FROM \(table) WHERE ts >= ?
+        """, arguments: [since])
+        return (row?["rx"] ?? 0, row?["tx"] ?? 0)
+    }
+
+    /// Downsample throughput rows into `bucketSeconds`-wide buckets: bytes summed, rates averaged,
+    /// timestamp pinned to the bucket start. Cuts a month's ~260K rows down to a few hundred so the
+    /// chart query returns fast. `ts` is stored as ISO text, so we bucket via strftime epoch.
+    private static func bucketedSamples(
+        _ db: GRDB.Database,
+        since: Date,
+        bucketSeconds: Int
+    ) throws -> [ThroughputSample] {
+        let rows = try Row.fetchAll(db, sql: """
+        SELECT (CAST(strftime('%s', ts) AS INTEGER) / ?) * ? AS bucket,
+               SUM(rxBytes) AS rxBytes,
+               SUM(txBytes) AS txBytes,
+               AVG(rxRate)  AS rxRate,
+               AVG(txRate)  AS txRate
+        FROM throughput_sample
+        WHERE ts >= ?
+        GROUP BY bucket
+        ORDER BY bucket ASC
+        """, arguments: [bucketSeconds, bucketSeconds, since])
+        return rows.map { row in
+            ThroughputSample(
+                id: row["bucket"], // bucket epoch is a stable, unique id for the chart's ForEach
+                ts: Date(timeIntervalSince1970: row["bucket"]),
+                interface: "",
+                rxBytes: row["rxBytes"],
+                txBytes: row["txBytes"],
+                rxRate: row["rxRate"],
+                txRate: row["txRate"]
+            )
+        }
+    }
+
+    /// Everything the Stats tab shows, read in a single off-thread pass. `completion` runs on main.
+    /// Today/week/month/peak come from the interface-level `throughput_sample` (so the headline
+    /// numbers capture *all* traffic, including unattributed system traffic nettop can't tie to a
+    /// process); all-time, the daily chart, tracking span, and top apps come from the never-pruned
+    /// `app_daily` rollup (throughput_sample only retains 30 days). All run off the main thread.
+    struct StatsSnapshot {
+        var today: (rx: Int64, tx: Int64) = (0, 0)
+        var week: (rx: Int64, tx: Int64) = (0, 0)
+        var month: (rx: Int64, tx: Int64) = (0, 0)
+        var allTime: (rx: Int64, tx: Int64) = (0, 0)
+        var peak: (rx: Double, tx: Double) = (0, 0)
+        var daily: [DailyTotal] = []
+        var trackedDays = 0
+        var earliestDay: String?
+        var topApps: [AppUsage] = []
+    }
+
+    func statsSnapshot(
+        todayStart: Date,
+        weekStart: Date,
+        monthStart: Date,
+        completion: @escaping @MainActor (StatsSnapshot) -> Void
+    ) {
+        pool.asyncRead { dbResult in
+            var snap = StatsSnapshot()
+            do {
+                let db = try dbResult.get()
+
+                // Window totals from the raw interface counter — a SUM over the indexed ts range,
+                // fast even at 30-days-of-10s-rows scale, and now off the main thread.
+                snap.today = try Self.sumBytes(db, table: "throughput_sample", since: todayStart)
+                snap.week = try Self.sumBytes(db, table: "throughput_sample", since: weekStart)
+                snap.month = try Self.sumBytes(db, table: "throughput_sample", since: monthStart)
+
+                // throughput_sample only retains 30 days, so all-time must come from the rollup.
+                if let row = try Row.fetchOne(
+                    db,
+                    sql:
+                    "SELECT COALESCE(SUM(rxBytes),0) AS rx, COALESCE(SUM(txBytes),0) AS tx FROM app_daily"
+                ) {
+                    snap.allTime = (row["rx"], row["tx"])
+                }
+
+                if let row = try Row.fetchOne(
+                    db,
+                    sql:
+                    "SELECT COALESCE(MAX(rxRate),0) AS rx, COALESCE(MAX(txRate),0) AS tx FROM throughput_sample"
+                ) {
+                    snap.peak = (row["rx"], row["tx"])
+                }
+
+                snap.daily = try DailyTotal.fetchAll(db, sql: """
+                SELECT day,
+                       COALESCE(SUM(rxBytes),0) AS rxBytes,
+                       COALESCE(SUM(txBytes),0) AS txBytes
+                FROM app_daily GROUP BY day ORDER BY day DESC LIMIT 30
+                """).reversed()
+
+                if let row = try Row.fetchOne(
+                    db,
+                    sql:
+                    "SELECT COUNT(DISTINCT day) AS days, MIN(day) AS earliest FROM app_daily"
+                ) {
+                    snap.trackedDays = row["days"]
+                    snap.earliestDay = row["earliest"]
+                }
+
+                snap.topApps = try Self.appUsageRollup(db, sinceDay: nil, limit: 8)
+            } catch {
+                NSLog("statsSnapshot read failed: \(error)")
+            }
+            let result = snap
+            DispatchQueue.main.async { MainActor.assumeIsolated { completion(result) } }
+        }
     }
 
     // MARK: - Maintenance

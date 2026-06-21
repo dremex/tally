@@ -14,6 +14,10 @@ struct StatsTab: View {
     @State private var trackedDays = 0
     @State private var earliestDay: String?
     @State private var topApps: [AppUsage] = []
+    /// False until the first off-thread snapshot lands — drives skeletons on initial open.
+    @State private var loaded = false
+    /// Discards a superseded in-flight read so it can't clobber newer data.
+    @State private var gate = LoadGate()
 
     private let db = Database.shared
     private let refresh = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
@@ -28,10 +32,14 @@ struct StatsTab: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                totalsGrid
-                dailyChartSection
-                peakAveragesSection
-                topAppsSection
+                if loaded {
+                    totalsGrid
+                    dailyChartSection
+                    peakAveragesSection
+                    topAppsSection
+                } else {
+                    statsSkeleton
+                }
             }
             .padding()
         }
@@ -174,23 +182,63 @@ struct StatsTab: View {
         }
     }
 
+    // MARK: - Skeleton (initial open, while the first read runs)
+
+    private var statsSkeleton: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                ForEach(0..<4, id: \.self) { _ in
+                    VStack(alignment: .leading, spacing: 6) {
+                        SkeletonBar(width: 56, height: 9, cornerRadius: 3)
+                        SkeletonBar(width: 84, height: 18)
+                        SkeletonBar(width: 100, height: 8, cornerRadius: 3)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            SkeletonBar(width: 160, height: 9, cornerRadius: 3)
+            SkeletonBar(height: 120, cornerRadius: 6)
+            ForEach(0..<4, id: \.self) { _ in
+                HStack {
+                    SkeletonBar(width: 110, height: 11)
+                    Spacer()
+                    SkeletonBar(width: 70, height: 11)
+                }
+            }
+        }
+        .shimmer()
+    }
+
     // MARK: - Load
 
     private func reload() {
         let cal = Calendar.current
         let now = Date()
-        today = db.totalBytes(since: cal.startOfDay(for: now))
-        week = db.totalBytes(since: now.addingTimeInterval(-6 * 86400))
+        let todayStart = cal.startOfDay(for: now)
+        let weekStart = now.addingTimeInterval(-6 * 86400)
         let monthStart = cal.date(from: cal.dateComponents([.year, .month], from: now)) ?? now
-        month = db.totalBytes(since: monthStart)
-        // All-time from the rollup (throughput_sample only retains 30 days).
-        allTime = db.allTimeBytes()
-        peak = db.peakRates()
-        daily = backfilledDaily(db.dailyTotals(limit: 30), days: 30, now: now, cal: cal)
-        let track = db.trackingSince()
-        trackedDays = track.days
-        earliestDay = track.earliest
-        topApps = db.appUsageDaily(sinceDay: nil, limit: 8)
+
+        let token = gate.begin()
+        db.statsSnapshot(
+            todayStart: todayStart,
+            weekStart: weekStart,
+            monthStart: monthStart
+        ) { snap in
+            // Drop results from a refresh superseded by a newer one (cheap insurance against overlap).
+            guard gate.isCurrent(token) else { return }
+            today = snap.today
+            week = snap.week
+            month = snap.month
+            allTime = snap.allTime
+            peak = snap.peak
+            daily = backfilledDaily(snap.daily, days: 30, now: now, cal: cal)
+            trackedDays = snap.trackedDays
+            earliestDay = snap.earliestDay
+            topApps = snap.topApps
+            loaded = true
+        }
     }
 
     /// Pad the DB's daily rows out to a full `days`-long window ending today, filling any missing
